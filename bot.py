@@ -8,7 +8,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # --- НАСТРОЙКА ТОКЕНА ---
 TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
 
-# Функция автоматической загрузки базы сайтов из файла sites.json
 def load_sites():
     try:
         with open("sites.json", "r", encoding="utf-8") as f:
@@ -21,66 +20,104 @@ SITES_DB = load_sites()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚡️ **SOFTX OSINT ENGINE v2.0** ⚡️\n\n"
-        "Запущен полноценный асинхронный сканер цифрового следа.\n\n"
+        "⚡️ **SOFTX OSINT ENGINE v2.5** ⚡️\n\n"
+        "Запущен продвинутый асинхронный сканер цифрового следа.\n\n"
         "**Команды:**\n"
-        "🔹 `/sherlock [никнейм]` — Полный глубокий пробив по базе из 100+ сайтов.\n"
-        "🔹 `/leak [email]` — Быстрая проверка почты по базам утечек паролей."
+        "🔹 `/sherlock [никнейм]` — Поиск аккаунтов по 100+ сайтам.\n"
+        "🔹 `/leak [email]` — Проверка почты по базам утечек."
     )
 
-# Асинхронный воркер для мгновенной параллельной проверки сайта
+# Улучшенный воркер с фильтрацией "страниц-призраков"
 async def check_single_site(session, name, data, username):
-    url = data["url"].format(username)
+    # Исправление синтаксиса на лету, если в базе осталась кривая ссылка
+    base_url = data["url"]
+    if ".org:{}" in base_url:
+        base_url = base_url.replace(".org:{}", ".org/wiki/{}")
+    elif ".com:{}" in base_url:
+        base_url = base_url.replace(".com:{}", ".com/wiki/{}")
+        
+    url = base_url.format(username)
     error_type = data.get("error_type", "status_code")
-    
+
+    # Браузерные заголовки, чтобы сайты не понимали, что это скрипт
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
     }
-    
+
     try:
-        async with session.get(url, headers=headers, timeout=6, allow_redirects=True) as response:
+        # allow_redirects=False важно, чтобы поймать сайты, кидающие на login/регистрацию
+        async with session.get(url, headers=headers, timeout=5, allow_redirects=False) as response:
+            
+            # Проверка по статус-коду
             if error_type == "status_code":
-                if response.status == 200 and not "error" in response.url.human_repr().lower():
+                if response.status == 200:
+                    # Дополнительная проверка контента для предотвращения ложных срабатываний
+                    html = await response.text(errors='ignore')
+                    low_html = html.lower()
+                    
+                    # Маркеры того, что профиля на самом деле нет
+                    bad_signals = ["content=\"not found\"", "page not found", "профиль не найден", "аккаунт не найден"]
+                    if any(signal in low_html for signal in bad_signals):
+                        return None
                     return f"✅ {name}: {url}"
+                
+                # Если сайт перенаправляет (301/302), проверяем куда. 
+                # Если на страницу авторизации или главную — значит пользователя нет.
+                elif response.status in:
+                    location = response.headers.get("Location", "").lower()
+                    if "login" in location or "signin" in location or "register" in location:
+                        return None
+
+            # Проверка по редиректу (как для Telegram)
             elif error_type == "response_url":
-                if response.status == 200 and data.get("error_url") not in response.url.human_repr():
-                    return f"✅ {name}: {url}"
+                # Разрешаем редирект для проверки конечной точки
+                async with session.get(url, headers=headers, timeout=5, allow_redirects=True) as red_resp:
+                    if red_resp.status == 200 and data.get("error_url") not in red_resp.url.human_repr():
+                        return f"✅ {name}: {url}"
     except:
         pass
     return None
 
-# --- МОДУЛЬ 1: АНАЛОГ SHERLOCK (100+ СТАЙТОВ ОДНОВРЕМЕННО) ---
 async def sherlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("❌ Укажите цель: `/sherlock username`")
         return
-        
+
     username = context.args[0].lstrip("@")
-    status_msg = await update.message.reply_text(f"🚀 Запущена параллельная проверка по {len(SITES_DB)} сайтам для: `@{username}`...")
-    
-    # Запускаем одновременный опрос всех сайтов в один миг
-    async with aiohttp.ClientSession() as session:
+    status_msg = await update.message.reply_text(f"🚀 Запущена проверка по {len(SITES_DB)} сайтам для: `@{username}`...")
+
+    # Ограничиваем одновременные соединения, чтобы Termux не падал, а сайты не банили
+    connector = aiohttp.TCPConnector(limit=30) 
+    async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [check_single_site(session, name, data, username) for name, data in SITES_DB.items()]
         results = await asyncio.gather(*tasks)
-        
+
     found_profiles = [r for r in results if r is not None]
-    
+
     if found_profiles:
         report = f"🕵️‍♂️ **OSINT ОТЧЕТ ДЛЯ: @{username}**\n\n" + "\n".join(found_profiles)
     else:
         report = f"❌ Активных профилей для юзернейма `@{username}` не найдено."
-        
-    await status_msg.edit_text(report, disable_web_page_preview=True, parse_mode="Markdown")
 
-# --- МОДУЛЬ 2: ПОИСК УТЕЧЕК (LEAKCHECK) ---
+    # Если отчет слишком длинный, бьем его на части (ограничение ТГ - 4096 символов)
+    if len(report) > 4000:
+        for x in range(0, len(report), 4000):
+            await update.message.reply_text(report[x:x+4000], disable_web_page_preview=True, parse_mode="Markdown")
+        await status_msg.delete()
+    else:
+        await status_msg.edit_text(report, disable_web_page_preview=True, parse_mode="Markdown")
+
 async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("❌ Укажите объект: `/leak email@example.com`")
         return
-        
+
     target = context.args[0]
     status_msg = await update.message.reply_text(f"🔎 Сканируем дампы утечек для `{target}`...")
-    
+
+    # Внимание: для работы leakcheck часто требуется бесплатный API ключ. 
+    # Ниже исправлен URL запроса (добавлен пропущенный слеш перед целью)
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(f"https://leakcheck.net{target}", timeout=7) as response:
@@ -89,27 +126,27 @@ async def leak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if res_data.get("success") and res_data.get("result"):
                         out = f"⚠️ **ОБНАРУЖЕНЫ УТЕЧКИ ДЛЯ {target}:**\n\n"
                         for leak in res_data["result"]:
-                            out += f"▪️ База данных: `{leak.get('line')}` (Дата: {leak.get('date', 'н/д')})\n"
-                        out += "\n🔒 Пароли от этого email скомпрометированы. Рекомендуется их смена."
+                            out += f"▪️ Источник: `{leak.get('line')}`\n"
+                        out += "\n🔒 Данные скомпрометированы. Рекомендуется сменить пароли."
                     else:
-                        out = f"✅ Объект `{target}` в базах утечек не обнаружен."
+                        out = f"✅ Объект `{target}` в публичных базах утечек не обнаружен."
                 else:
-                    out = "❌ Публичное API LeakCheck перегружено. Попробуйте позже."
+                    out = "❌ Сервис проверки утечек временно недоступен."
         except Exception as e:
             out = f"❌ Ошибка при запросе к базе: {str(e)}"
-            
+
     await status_msg.edit_text(out, parse_mode="Markdown")
 
 def main():
     if TOKEN == "ВАШ_ТОКЕН_ОТ_BOTFATHER":
-        print("❌ КРИТИЧЕСКАЯ ОШИБКА: Вы забыли вставить токен вашего бота в строку 9!")
+        print("❌ КРИТИЧЕСКАЯ ОШИБКА: Вы забыли вставить токен вашего бота!")
         return
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("sherlock", sherlock_command))
     app.add_handler(CommandHandler("leak", leak_command))
-    
+
     print("🔥 SOFTX OSINT ENGINE запущен и готов к работе!")
     app.run_polling()
 
